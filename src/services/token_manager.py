@@ -16,6 +16,45 @@ class TokenManager:
         self.db = db
         self.flow_client = flow_client
         self._lock = asyncio.Lock()
+        self._project_lock = asyncio.Lock()
+        self._project_pool_size = 2
+
+    def _sort_projects(self, projects: List[Project]) -> List[Project]:
+        """Sort projects in a stable order for round-robin selection."""
+        return sorted(projects, key=lambda project: (project.id or 0, project.project_id))
+
+    def _build_project_name(self, pool_index: int) -> str:
+        """Build a project name for the pool."""
+        base_name = datetime.now().strftime("%b %d - %H:%M")
+        return f"{base_name} P{pool_index}"
+
+    async def _create_project_for_token(self, token: Token, pool_index: int) -> Project:
+        """Create a new pooled project for a token and persist it."""
+        project_name = self._build_project_name(pool_index)
+        project_id = await self.flow_client.create_project(token.st, project_name)
+        debug_logger.log_info(
+            f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
+        )
+        project = Project(
+            project_id=project_id,
+            token_id=token.id,
+            project_name=project_name,
+        )
+        project.id = await self.db.add_project(project)
+        return project
+
+    def _select_next_project(self, token: Token, projects: List[Project]) -> Project:
+        """Select the next project from the pool in round-robin order."""
+        ordered_projects = self._sort_projects(projects)
+        if not ordered_projects:
+            raise ValueError("No available projects for token")
+
+        if token.current_project_id:
+            for index, project in enumerate(ordered_projects):
+                if project.project_id == token.current_project_id:
+                    return ordered_projects[(index + 1) % len(ordered_projects)]
+
+        return ordered_projects[0]
 
     # ========== Token CRUD ==========
 
@@ -432,48 +471,30 @@ class TokenManager:
             return None
 
     async def ensure_project_exists(self, token_id: int) -> str:
-        """确保Token有可用的Project
+        """Ensure a token has a pooled set of projects and return one in round-robin order."""
+        async with self._project_lock:
+            token = await self.db.get_token(token_id)
+            if not token:
+                raise ValueError("Token not found")
 
-        Returns:
-            project_id
-        """
-        token = await self.db.get_token(token_id)
-        if not token:
-            raise ValueError("Token not found")
+            projects = [project for project in await self.db.get_projects_by_token(token_id) if project.is_active]
+            projects = self._sort_projects(projects)
 
-        # 如果已有project_id,直接返回
-        if token.current_project_id:
-            return token.current_project_id
+            try:
+                while len(projects) < self._project_pool_size:
+                    new_project = await self._create_project_for_token(token, len(projects) + 1)
+                    projects.append(new_project)
+                    projects = self._sort_projects(projects)
 
-        # 创建新Project
-        now = datetime.now()
-        project_name = now.strftime("%b %d - %H:%M")
-
-        try:
-            project_id = await self.flow_client.create_project(token.st, project_name)
-            debug_logger.log_info(f"[PROJECT] Created project for token {token_id}: {project_name}")
-
-            # 更新Token
-            await self.db.update_token(
-                token_id,
-                current_project_id=project_id,
-                current_project_name=project_name
-            )
-
-            # 保存Project到数据库
-            project = Project(
-                project_id=project_id,
-                token_id=token_id,
-                project_name=project_name
-            )
-            await self.db.add_project(project)
-
-            return project_id
-
-        except Exception as e:
-            raise ValueError(f"Failed to create project: {str(e)}")
-
-    # ========== Token使用统计 ==========
+                selected_project = self._select_next_project(token, projects)
+                await self.db.update_token(
+                    token_id,
+                    current_project_id=selected_project.project_id,
+                    current_project_name=selected_project.project_name,
+                )
+                return selected_project.project_id
+            except Exception as e:
+                raise ValueError(f"Failed to prepare project pool: {str(e)}")
 
     async def record_usage(self, token_id: int, is_video: bool = False):
         """Record token usage"""
