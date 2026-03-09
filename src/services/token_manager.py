@@ -17,6 +17,7 @@ class TokenManager:
         self.flow_client = flow_client
         self._lock = asyncio.Lock()
         self._project_lock = asyncio.Lock()
+        self._refresh_futures: dict[int, asyncio.Task] = {}
         self._project_pool_size = 4
 
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
@@ -320,40 +321,46 @@ class TokenManager:
         return valid_token is not None
 
 
-    async def _refresh_at(self, token_id: int) -> bool:
-        """内部方法: 刷新AT
-
-        如果 AT 刷新失败（ST 可能过期），会尝试通过浏览器自动刷新 ST，
-        然后重试 AT 刷新。
-
-        Returns:
-            True if refresh successful, False otherwise
-        """
+    async def _refresh_at_inner(self, token_id: int) -> bool:
+        """Perform exactly one real AT refresh attempt."""
         async with self._lock:
             token = await self.db.get_token(token_id)
             if not token:
                 return False
 
-            # 第一次尝试刷新 AT
             result = await self._do_refresh_at(token_id, token.st)
             if result:
                 return True
 
-            # AT 刷新失败，尝试自动更新 ST
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: 第一次 AT 刷新失败，尝试自动更新 ST...")
-            
+            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh...")
             new_st = await self._try_refresh_st(token_id, token)
             if new_st:
-                # ST 更新成功，重试 AT 刷新
-                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST 已更新，重试 AT 刷新...")
+                debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
                 result = await self._do_refresh_at(token_id, new_st)
                 if result:
                     return True
 
-            # 所有刷新尝试都失败，禁用 Token
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: 所有刷新尝试失败，禁用 Token")
+            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
             await self.disable_token(token_id)
             return False
+
+    async def _refresh_at(self, token_id: int) -> bool:
+        """Coalesce concurrent AT refresh calls for the same token."""
+        existing_task = self._refresh_futures.get(token_id)
+        if existing_task:
+            return await existing_task
+
+        async def runner() -> bool:
+            try:
+                return await self._refresh_at_inner(token_id)
+            finally:
+                current = self._refresh_futures.get(token_id)
+                if current is task:
+                    self._refresh_futures.pop(token_id, None)
+
+        task = asyncio.create_task(runner())
+        self._refresh_futures[token_id] = task
+        return await task
 
     async def _do_refresh_at(self, token_id: int, st: str) -> bool:
         """执行 AT 刷新的核心逻辑
