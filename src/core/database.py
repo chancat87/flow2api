@@ -685,7 +685,8 @@ class Database:
             if not await self._column_exists(db, "request_logs", "progress"):
                 await db.execute("ALTER TABLE request_logs ADD COLUMN progress INTEGER DEFAULT 0")
             if not await self._column_exists(db, "request_logs", "updated_at"):
-                await db.execute("ALTER TABLE request_logs ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                await db.execute("ALTER TABLE request_logs ADD COLUMN updated_at TIMESTAMP")
+            await db.execute("UPDATE request_logs SET updated_at = created_at WHERE updated_at IS NULL")
         except Exception as e:
             print(f"?? request_logs?????: {e}")
             # Continue even if migration fails
@@ -1238,6 +1239,12 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             payload_columns = "rl.request_body, rl.response_body," if include_payload else ""
+            has_status_text = await self._column_exists(db, "request_logs", "status_text")
+            has_progress = await self._column_exists(db, "request_logs", "progress")
+            has_updated_at = await self._column_exists(db, "request_logs", "updated_at")
+            status_text_column = "rl.status_text," if has_status_text else "'' as status_text,"
+            progress_column = "rl.progress," if has_progress else "0 as progress,"
+            updated_at_column = "rl.updated_at," if has_updated_at else "rl.created_at as updated_at,"
 
             if token_id:
                 cursor = await db.execute(f"""
@@ -1248,10 +1255,10 @@ class Database:
                         {payload_columns}
                         rl.status_code,
                         rl.duration,
-                        rl.status_text,
-                        rl.progress,
+                        {status_text_column}
+                        {progress_column}
                         rl.created_at,
-                        rl.updated_at,
+                        {updated_at_column}
                         t.email as token_email,
                         t.name as token_username
                     FROM request_logs rl
@@ -1269,10 +1276,10 @@ class Database:
                         {payload_columns}
                         rl.status_code,
                         rl.duration,
-                        rl.status_text,
-                        rl.progress,
+                        {status_text_column}
+                        {progress_column}
                         rl.created_at,
-                        rl.updated_at,
+                        {updated_at_column}
                         t.email as token_email,
                         t.name as token_username
                     FROM request_logs rl
@@ -1288,7 +1295,13 @@ class Database:
         """Get single request log detail including payload fields"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("""
+            has_status_text = await self._column_exists(db, "request_logs", "status_text")
+            has_progress = await self._column_exists(db, "request_logs", "progress")
+            has_updated_at = await self._column_exists(db, "request_logs", "updated_at")
+            status_text_column = "rl.status_text," if has_status_text else "'' as status_text,"
+            progress_column = "rl.progress," if has_progress else "0 as progress,"
+            updated_at_column = "rl.updated_at," if has_updated_at else "rl.created_at as updated_at,"
+            cursor = await db.execute(f"""
                 SELECT
                     rl.id,
                     rl.token_id,
@@ -1297,10 +1310,10 @@ class Database:
                     rl.response_body,
                     rl.status_code,
                     rl.duration,
-                    rl.status_text,
-                    rl.progress,
+                    {status_text_column}
+                    {progress_column}
                     rl.created_at,
-                    rl.updated_at,
+                    {updated_at_column}
                     t.email as token_email,
                     t.name as token_username
                 FROM request_logs rl
